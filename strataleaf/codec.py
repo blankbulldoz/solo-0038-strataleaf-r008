@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 from .errors import InvalidDocument
 
 NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
@@ -70,3 +71,42 @@ def scalar_token(value):
     if isinstance(value, (int, float)):
         return "n:" + str(value) if isinstance(value, int) else "n:" + str(int(value)) if value.is_integer() else "n:" + repr(value)
     return "v:" + dumps(value)
+
+
+def _ordered_number_token(value):
+    # Map every JSON number onto a lexically ordered fixed-width token.
+    # Double precision preserves ordering for in-range values; integers beyond
+    # the finite double domain saturate at the corresponding end marker, and
+    # the query layer always re-evaluates the original predicate afterwards.
+    try:
+        number = float(value)
+    except OverflowError:
+        return "n:f:" + ("f" * 16 if value > 0 else "0" * 16)
+    if number == 0.0:
+        # JSON and Python treat -0.0 and 0 as the same value; sharing the
+        # token keeps equality and range lookups lossless across both forms.
+        number = 0.0
+    ordered = struct.unpack(">Q", struct.pack(">d", number))[0]
+    if ordered >> 63:
+        ordered ^= (1 << 64) - 1
+    else:
+        ordered |= 1 << 63
+    return "n:f:" + format(ordered, "016x")
+
+
+def range_token(value):
+    """Order-preserving token used by range indexes; None means not indexable."""
+    if value is MISSING or isinstance(value, (dict, list)):
+        return None
+    if value is None:
+        return "v:null"
+    if isinstance(value, bool):
+        return "b:" + str(int(value))
+    if isinstance(value, (int, float)):
+        return _ordered_number_token(value)
+    return "s:" + str(value).encode("utf-8").hex()
+
+
+def index_token(kind, value):
+    """Projection token for the given index kind; None skips the document."""
+    return range_token(value) if kind == "range" else scalar_token(value)

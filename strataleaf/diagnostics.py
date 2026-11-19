@@ -1,4 +1,4 @@
-from .codec import digest, field, loads, scalar_token
+from .codec import digest, field, index_token, loads
 from .mvcc import visible_rows
 
 
@@ -31,7 +31,7 @@ class Diagnostics:
                 for definition in connection.execute("SELECT * FROM index_defs"):
                     tokens = set()
                     for row in visible_rows(connection, definition["collection"], head):
-                        token = scalar_token(field(loads(row["body"]), definition["field"]))
+                        token = index_token(definition["kind"], field(loads(row["body"]), definition["field"]))
                         if token is None:
                             continue
                         if definition["unique_flag"] and token in tokens:

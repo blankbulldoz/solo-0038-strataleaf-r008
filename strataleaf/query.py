@@ -2,9 +2,9 @@ from dataclasses import dataclass
 from .codec import digest
 from .cursors import decode_cursor, encode_cursor
 from .errors import InvalidCursor, InvalidDocument, NotFound
-from .indexes import equality_candidates
+from .indexes import equality_candidates, range_candidates
 from .mvcc import checked_revision, record, visible_rows, latest_row
-from .predicates import equality_terms, matches, validate_predicate
+from .predicates import equality_terms, matches, range_terms, validate_predicate
 
 
 @dataclass(frozen=True)
@@ -36,15 +36,18 @@ class QueryEngine:
                 if not isinstance(after, str):
                     raise InvalidCursor("cursor has no key boundary")
             revision = checked_revision(self.store, revision)
+            head = int(self.store.get("head"))
             plan = {"access": "version_scan", "index": None}
             candidates = None
-            if not force_scan and revision == int(self.store.get("head")):
-                for path, value in equality_terms(predicate):
-                    indexed = equality_candidates(connection, collection, path, value)
-                    if indexed is not None:
-                        index_name, candidates = indexed
-                        plan = {"access": "equality_index", "index": index_name}
-                        break
+            if force_scan:
+                plan["reason"] = "force_scan requested"
+            elif revision != head:
+                # Indexes project only the current head; historical reads
+                # keep the original fixed-revision version-scan semantics.
+                plan["reason"] = "historical revision uses a fixed read view"
+            else:
+                plan = self._choose_index(connection, collection, predicate)
+                candidates = plan.pop("candidates", None)
             if candidates is None:
                 rows = visible_rows(connection, collection, revision)
             else:
@@ -66,3 +69,30 @@ class QueryEngine:
                 continuation = encode_cursor(self.store, {"database": self.store.get("database_id"),
                     "query": fingerprint, "revision": revision, "after": output[-1].key})
             return Page(output, revision, continuation, {**plan, "examined": examined})
+
+    def _choose_index(self, connection, collection, predicate):
+        # Equality indexes remain the preferred access path because their
+        # tokens identify exact values (and enforce uniqueness).
+        for path, value in equality_terms(predicate):
+            indexed = equality_candidates(connection, collection, path, value)
+            if indexed is not None:
+                index_name, keys = indexed
+                return {"access": "equality_index", "index": index_name, "candidates": keys}
+        groups = range_terms(predicate)
+        for path in sorted(groups):
+            indexed = range_candidates(connection, collection, groups[path])
+            if indexed is None:
+                continue
+            index_name, keys, detail = indexed
+            if detail.get("unindexable"):
+                return {"access": "version_scan", "index": None,
+                        "reason": "range leaf compares against an unindexable value"}
+            return {"access": "range_index", "index": index_name, "bounds": detail["bounds"],
+                    "candidates": keys}
+        if predicate is None:
+            reason = "no predicate"
+        elif groups:
+            reason = "no matching range index"
+        else:
+            reason = "predicate has no conjunctive comparison bound"
+        return {"access": "version_scan", "index": None, "reason": reason}

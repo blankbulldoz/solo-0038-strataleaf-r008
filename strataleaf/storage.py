@@ -16,15 +16,23 @@ CREATE TABLE IF NOT EXISTS versions (
  expires REAL, PRIMARY KEY(collection,key,rev), FOREIGN KEY(collection) REFERENCES collections(name));
 CREATE INDEX IF NOT EXISTS version_revision ON versions(rev);
 CREATE TABLE IF NOT EXISTS index_defs (
- collection TEXT NOT NULL, name TEXT NOT NULL, field TEXT NOT NULL, unique_flag INTEGER NOT NULL,
+ collection TEXT NOT NULL, name TEXT NOT NULL, field TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'equality',
+ unique_flag INTEGER NOT NULL,
  PRIMARY KEY(collection,name), FOREIGN KEY(collection) REFERENCES collections(name));
 CREATE TABLE IF NOT EXISTS index_values (
  collection TEXT NOT NULL, name TEXT NOT NULL, token TEXT NOT NULL, key TEXT NOT NULL,
  PRIMARY KEY(collection,name,token,key), FOREIGN KEY(collection,name) REFERENCES index_defs(collection,name) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
+CREATE INDEX IF NOT EXISTS index_order ON index_values(collection,name,token);
 CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
 """
+
+
+def _migrate(connection):
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(index_defs)")}
+    if "kind" not in columns:
+        connection.execute("ALTER TABLE index_defs ADD COLUMN kind TEXT NOT NULL DEFAULT 'equality'")
 
 
 class Storage:
@@ -38,6 +46,7 @@ class Storage:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.executescript(DDL)
+        _migrate(self.connection)
         with self.atomic():
             initial = {"format": "1", "head": "0", "floor": "0", "database_id": str(uuid.uuid4()),
                        "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "", "catalog_epoch": "0"}

@@ -23,6 +23,71 @@ def rejected(call, error):
     raise RuntimeError("operation unexpectedly succeeded")
 
 
+def range_index_flow(db):
+    db.catalog.create("readings", {"fields": {"value": "number"}, "required": []})
+    rows = {"r_neg": -12.5, "r_zero": 0, "r_one_int": 1, "r_one_float": 1.0,
+            "r_two": 2, "r_big": 1000000, "r_huge": 10**100}
+    batch = db.batch("range_seed")
+    for key, number in rows.items():
+        batch.put("readings", key, {"value": number})
+    seeded = batch.commit().revision
+    # A schema-free collection exercises null, missing, booleans and containers
+    # next to ordinary numbers; the odd-typed values must never leak or vanish.
+    db.catalog.create("loose")
+    loose_batch = db.batch()
+    for key, document in (("null_value", {"value": None}), ("no_value", {"other": 1}),
+                          ("flag", {"value": True}), ("container", {"value": [1, 2]}),
+                          ("inside", {"value": 4}), ("outside", {"value": 40})):
+        loose_batch.put("loose", key, document)
+    loose_batch.commit()
+    db.indexes.create("readings", "value_range", "value", kind="range")
+    db.indexes.create("loose", "value_range", "value", kind="range")
+    bounds = {"and": [{"field": "value", "op": "ge", "value": -1}, {"field": "value", "op": "lt", "value": 2}]}
+    page = db.query("readings", bounds, limit=2)
+    scanned = db.query("readings", bounds, limit=2, force_scan=True)
+    if [row.key for row in page.records] != [row.key for row in scanned.records]:
+        raise RuntimeError("range index and scan differ")
+    # Mutations must keep the projection identical to a full version scan.
+    db.batch().put("readings", "r_fresh", {"value": 1.5}).delete("readings", "r_two") \
+        .put("readings", "r_neg", {"value": -50}, expected=seeded).commit()
+    after_write = db.query("readings", bounds)
+    if [row.key for row in after_write.records] != [row.key for row in db.query("readings", bounds, force_scan=True).records]:
+        raise RuntimeError("range index drifted after writes and deletes")
+    historical = db.query("readings", bounds, revision=seeded)
+    if historical.plan["access"] != "version_scan":
+        raise RuntimeError("historical read must not consume the current index")
+    # Pagination pins the read revision; later writes cannot change later pages.
+    first = db.query("readings", {"field": "value", "op": "gt", "value": -100}, limit=2)
+    db.batch().put("readings", "r_late", {"value": 0.5}).commit()
+    keys, cursor = [row.key for row in first.records], first.cursor
+    while cursor:
+        nxt = db.query("readings", {"field": "value", "op": "gt", "value": -100}, limit=2, cursor=cursor)
+        keys.extend(row.key for row in nxt.records)
+        cursor = nxt.cursor
+    if "r_late" in keys or keys != [row.key for row in db.query("readings",
+            {"field": "value", "op": "gt", "value": -100}, revision=first.revision, force_scan=True).records]:
+        raise RuntimeError("range pagination changed the fixed read view")
+    loose_predicate = {"and": [{"field": "value", "op": "ge", "value": -10}, {"field": "value", "op": "le", "value": 10}]}
+    loose = db.query("loose", loose_predicate)
+    if loose.records != db.query("loose", loose_predicate, force_scan=True).records:
+        raise RuntimeError("null/missing/typed values were dropped or misfiltered")
+    disjunction = {"or": [{"field": "value", "op": "gt", "value": 10}, {"field": "value", "op": "lt", "value": -10}]}
+    fallback = db.query("readings", disjunction)
+    unindexed = db.query("readings", {"field": "absent", "op": "gt", "value": 0})
+    if fallback.plan["access"] != "version_scan" or unindexed.plan["access"] != "version_scan":
+        raise RuntimeError("planner failed to explain the scan fallback")
+    if not db.diagnostics.inspect(True)["ok"]:
+        raise RuntimeError("index projection failed deep inspection")
+    return {"indexes": db.indexes.list("readings"), "bounded_plan": page.plan,
+            "bounded_keys": [row.key for row in page.records],
+            "after_write_plan": after_write.plan, "after_write_keys": [row.key for row in after_write.records],
+            "historical_plan": historical.plan,
+            "loose_plan": loose.plan, "loose_keys": [row.key for row in loose.records],
+            "fallback_plan": fallback.plan, "unindexed_plan": unindexed.plan,
+            "unique_rejected": rejected(lambda: db.indexes.create("readings", "bad", "value", kind="range", unique=True), InvalidDocument),
+            "kind_rejected": rejected(lambda: db.indexes.create("readings", "bad", "value", kind="hash"), InvalidDocument)}
+
+
 def run(flow):
     with tempfile.TemporaryDirectory(prefix="strataleaf-example-") as directory:
         folder = Path(directory)
@@ -70,6 +135,8 @@ def run(flow):
                     raise RuntimeError("index and scan differ")
                 collision = rejected(lambda: db.batch().put("segments", "new", {"region": "north", "sequence": 8, "code": "c0"}).commit(), Conflict)
                 output = {"plan": indexed.plan, "keys": [row.key for row in indexed.records], "collision": collision, "integrity": db.diagnostics.inspect(True)}
+            elif flow == "range_index":
+                output = range_index_flow(db)
             elif flow == "feed":
                 db.feed.register("mirror", 0)
                 db.batch().delete("segments", "seg_00").commit()

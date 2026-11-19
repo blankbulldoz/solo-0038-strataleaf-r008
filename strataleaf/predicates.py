@@ -83,3 +83,31 @@ def equality_terms(expression):
     if expression.get("op") == "eq":
         return [(expression["field"], expression["value"])]
     return []
+
+
+INDEXABLE_RANGE_OPS = ("eq", "lt", "le", "gt", "ge")
+
+
+def range_terms(expression):
+    """Group conjunctive comparison leaves by field path.
+
+    Returns {} when nothing indexable can be derived (including predicates
+    built solely with or/not, whose branches are deliberately not descended),
+    so the query engine falls back to a full version scan. Non-indexable
+    children inside an and are skipped rather than fatal: the query engine
+    always re-evaluates the complete predicate against each candidate.
+    """
+    if expression is None:
+        return {}
+    if "and" in expression:
+        merged = {}
+        for child in expression["and"]:
+            for path, leaves in range_terms(child).items():
+                merged.setdefault(path, []).extend(leaves)
+        return merged
+    if "or" in expression or "not" in expression:
+        return {}
+    if expression.get("op") in INDEXABLE_RANGE_OPS:
+        path = expression["field"]
+        return {path: [(path, expression["op"], expression["value"])]}
+    return {}

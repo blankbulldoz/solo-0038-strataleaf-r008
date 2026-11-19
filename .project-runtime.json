@@ -33,6 +33,10 @@
       "command": "python3 -m examples.workflows index"
     },
     {
+      "workflow_id": "range_index",
+      "command": "python3 -m examples.workflows range_index"
+    },
+    {
       "workflow_id": "feed",
       "command": "python3 -m examples.workflows feed"
     },
